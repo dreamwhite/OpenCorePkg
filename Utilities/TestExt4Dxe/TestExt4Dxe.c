@@ -213,8 +213,8 @@ LLVMFuzzerTestOneInput (
 
     Ext4WriteFile (NewHandle, &BufferSize, Buffer);
 
-    Len    = 0;
-    Info   = NULL;
+    Len  = 0;
+    Info = NULL;
 
     Status = Ext4GetInfo (NewHandle, &gEfiFileInfoGuid, &Len, Info);
     if (Status == EFI_BUFFER_TOO_SMALL) {
