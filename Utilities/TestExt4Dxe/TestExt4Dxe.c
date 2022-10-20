@@ -94,6 +94,9 @@ LLVMFuzzerTestOneInput (
   VOID               *Buffer;
   EFI_FILE_PROTOCOL  *NewHandle;
   CHAR16             *FileName;
+  VOID               *Info;
+  UINTN              Len;
+  UINT64             Position;
 
   mFuzzOffset  = 0;
   mFuzzPointer = FuzzData;
@@ -191,7 +194,59 @@ LLVMFuzzerTestOneInput (
 
   Status = Ext4Open (This, &NewHandle, FileName, EFI_FILE_MODE_READ, 0);
   if (Status == EFI_SUCCESS) {
+    Status = Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+    if (Status == EFI_BUFFER_TOO_SMALL) {
+      Buffer = AllocateZeroPool (BufferSize);
+      if (Buffer == NULL) {
+        FreePool (FileName);
+        FreePool (Part->BlockIo->Media);
+        FreePool (Part->BlockIo);
+        FreePool (Part->DiskIo);
+        FreePool (Part);
+        return 0;
+      }
+    }
+
+    ASAN_CHECK_MEMORY_REGION (Buffer, BufferSize);
+
     Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+
+    Ext4WriteFile (NewHandle, &BufferSize, Buffer);
+
+    Len    = 0;
+    Info   = NULL;
+
+    Status = Ext4GetInfo (NewHandle, &gEfiFileInfoGuid, &Len, Info);
+    if (Status == EFI_BUFFER_TOO_SMALL) {
+      Info = AllocateZeroPool (Len);
+      Ext4GetInfo (NewHandle, &gEfiFileInfoGuid, &Len, Info);
+      FreePool (Info);
+    }
+
+    Len    = 0;
+    Status = Ext4GetInfo (NewHandle, &gEfiFileSystemInfoGuid, &Len, Info);
+    if (Status == EFI_BUFFER_TOO_SMALL) {
+      Info = AllocateZeroPool (Len);
+      Ext4GetInfo (NewHandle, &gEfiFileSystemInfoGuid, &Len, Info);
+      FreePool (Info);
+    }
+
+    Len    = 0;
+    Status = Ext4GetInfo (NewHandle, &gEfiFileSystemVolumeLabelInfoIdGuid, &Len, Info);
+    if (Status == EFI_BUFFER_TOO_SMALL) {
+      Info = AllocateZeroPool (Len);
+      Ext4GetInfo (NewHandle, &gEfiFileSystemVolumeLabelInfoIdGuid, &Len, Info);
+      FreePool (Info);
+    }
+
+    Ext4SetInfo (NewHandle, &gEfiFileSystemVolumeLabelInfoIdGuid, Len, Info);
+
+    Ext4GetPosition (NewHandle, &Position);
+    while (!EFI_ERROR (Ext4SetPosition (NewHandle, Position))) {
+      ++Position;
+    }
+
+    Ext4Delete (NewHandle);
   }
 
   FreePool (Buffer);
