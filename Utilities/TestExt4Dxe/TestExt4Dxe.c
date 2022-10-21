@@ -56,6 +56,35 @@ EfiLibUninstallAllDriverProtocols2 (
   return EFI_NOT_FOUND;
 }
 
+VOID
+FreeAll (
+  IN CHAR16          *FileName,
+  IN EXT4_PARTITION  *Part
+  )
+{
+  FreePool (FileName);
+
+  if (Part != NULL) {
+    if (Part->DiskIo != NULL) {
+      FreePool (Part->DiskIo);
+    }
+
+    if (Part->BlockIo != NULL) {
+      if (Part->BlockIo->Media != NULL) {
+        FreePool (Part->BlockIo->Media);
+      }
+
+      FreePool (Part->BlockIo);
+    }
+
+    if (Part->Root != NULL) {
+      Ext4UnmountAndFreePartition (Part);
+    } else if (Part != NULL) {
+      FreePool (Part);
+    }
+  }
+}
+
 EFI_STATUS
 EFIAPI
 FuzzReadDisk (
@@ -102,8 +131,34 @@ LLVMFuzzerTestOneInput (
   mFuzzPointer = FuzzData;
   mFuzzSize    = FuzzSize;
 
-  Part = AllocateZeroPool (sizeof (*Part));
+  Part       = NULL;
+  BufferSize = 100;
+
+  //
+  // Construct file name
+  //
+  FileName = AllocateZeroPool (BufferSize);
+  if (FileName == NULL) {
+    return 0;
+  }
+
+  ASAN_CHECK_MEMORY_REGION (FileName, BufferSize);
+
+  if ((mFuzzSize - mFuzzOffset) < BufferSize) {
+    FreeAll (FileName, Part);
+    return 0;
+  }
+
+  CopyMem (FileName, mFuzzPointer, BufferSize - 2);
+  mFuzzPointer += BufferSize - 2;
+  mFuzzOffset  += BufferSize - 2;
+
+  //
+  // Construct File System
+  //
+  Part = AllocateZeroPool (sizeof (EXT4_PARTITION));
   if (Part == NULL) {
+    FreeAll (FileName, Part);
     return 0;
   }
 
@@ -113,7 +168,7 @@ LLVMFuzzerTestOneInput (
 
   Part->DiskIo = AllocateZeroPool (sizeof (EFI_DISK_IO_PROTOCOL));
   if (Part->DiskIo == NULL) {
-    FreePool (Part);
+    FreeAll (FileName, Part);
     return 0;
   }
 
@@ -123,8 +178,7 @@ LLVMFuzzerTestOneInput (
 
   Part->BlockIo = AllocateZeroPool (sizeof (EFI_BLOCK_IO_PROTOCOL));
   if (Part->BlockIo == NULL) {
-    FreePool (Part->DiskIo);
-    FreePool (Part);
+    FreeAll (FileName, Part);
     return 0;
   }
 
@@ -132,9 +186,7 @@ LLVMFuzzerTestOneInput (
 
   Part->BlockIo->Media = AllocateZeroPool (sizeof (EFI_BLOCK_IO_MEDIA));
   if (Part->BlockIo->Media == NULL) {
-    FreePool (Part->BlockIo);
-    FreePool (Part->DiskIo);
-    FreePool (Part);
+    FreeAll (FileName, Part);
     return 0;
   }
 
@@ -142,80 +194,41 @@ LLVMFuzzerTestOneInput (
 
   Status = Ext4OpenSuperblock (Part);
   if (EFI_ERROR (Status)) {
-    FreePool (Part->BlockIo->Media);
-    FreePool (Part->BlockIo);
-    FreePool (Part->DiskIo);
-    FreePool (Part);
+    FreeAll (FileName, Part);
     return 0;
   }
 
   Part->Interface.Revision   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_REVISION;
   Part->Interface.OpenVolume = Ext4OpenVolume;
 
-  BufferSize = 100;
-  Buffer     = AllocateZeroPool (BufferSize);
-  if (Buffer == NULL) {
-    FreePool (Part->BlockIo->Media);
-    FreePool (Part->BlockIo);
-    FreePool (Part->DiskIo);
-    FreePool (Part);
-    return 0;
-  }
-
-  ASAN_CHECK_MEMORY_REGION (Buffer, BufferSize);
-
-  FileName = AllocateZeroPool (BufferSize);
-  if (FileName == NULL) {
-    FreePool (Buffer);
-    FreePool (Part->BlockIo->Media);
-    FreePool (Part->BlockIo);
-    FreePool (Part->DiskIo);
-    FreePool (Part);
-    return 0;
-  }
-
-  ASAN_CHECK_MEMORY_REGION (FileName, BufferSize);
-
-  if ((mFuzzSize - mFuzzOffset) < BufferSize) {
-    FreePool (Buffer);
-    FreePool (FileName);
-    FreePool (Part->BlockIo->Media);
-    FreePool (Part->BlockIo);
-    FreePool (Part->DiskIo);
-    FreePool (Part);
-    return 0;
-  }
-
-  CopyMem (FileName, mFuzzPointer, BufferSize - 2);
-  mFuzzPointer += BufferSize - 2;
-  mFuzzOffset  += BufferSize - 2;
-
   This = (EFI_FILE_PROTOCOL *)Part->Root;
 
+  //
+  // Test Ext4Dxe driver
+  //
   Status = Ext4Open (This, &NewHandle, FileName, EFI_FILE_MODE_READ, 0);
   if (Status == EFI_SUCCESS) {
-    Status = Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+    Buffer     = NULL;
+    BufferSize = 0;
+    Status     = Ext4ReadFile (NewHandle, &BufferSize, Buffer);
     if (Status == EFI_BUFFER_TOO_SMALL) {
       Buffer = AllocateZeroPool (BufferSize);
       if (Buffer == NULL) {
-        FreePool (FileName);
-        FreePool (Part->BlockIo->Media);
-        FreePool (Part->BlockIo);
-        FreePool (Part->DiskIo);
-        FreePool (Part);
+        FreeAll (FileName, Part);
         return 0;
       }
+
+      ASAN_CHECK_MEMORY_REGION (Buffer, BufferSize);
+
+      Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+
+      Ext4WriteFile (NewHandle, &BufferSize, Buffer);
+
+      FreePool (Buffer);
     }
 
-    ASAN_CHECK_MEMORY_REGION (Buffer, BufferSize);
-
-    Ext4ReadFile (NewHandle, &BufferSize, Buffer);
-
-    Ext4WriteFile (NewHandle, &BufferSize, Buffer);
-
-    Len  = 0;
-    Info = NULL;
-
+    Len    = 0;
+    Info   = NULL;
     Status = Ext4GetInfo (NewHandle, &gEfiFileInfoGuid, &Len, Info);
     if (Status == EFI_BUFFER_TOO_SMALL) {
       Info = AllocateZeroPool (Len);
@@ -249,12 +262,7 @@ LLVMFuzzerTestOneInput (
     Ext4Delete (NewHandle);
   }
 
-  FreePool (Buffer);
-  FreePool (FileName);
-  FreePool (Part->BlockIo->Media);
-  FreePool (Part->BlockIo);
-  FreePool (Part->DiskIo);
-  FreePool (Part);
+  FreeAll (FileName, Part);
 
   return 0;
 }
