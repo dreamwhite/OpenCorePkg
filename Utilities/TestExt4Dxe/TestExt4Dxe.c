@@ -7,6 +7,11 @@
 #include <UserFile.h>
 #include <string.h>
 
+#define MAP_TABLE_SIZE  0x100
+#define CHAR_FAT_VALID  0x01
+
+#define TO_UPPER(a)  (CHAR16) ((a) <= 0xFF ? mEngUpperMap[a] : (a))
+
 EFI_GUID  gEfiUnicodeCollationProtocolGuid = {
   0x1D85CD7F, 0xF43D, 0x11D2, { 0x9A, 0x0C, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D }
 };
@@ -20,6 +25,142 @@ UINT8  _gPcd_FixedAtBuild_PcdUefiVariableDefaultPlatformLang[6] = { 101, 110, 45
 UINTN        mFuzzOffset;
 UINTN        mFuzzSize;
 CONST UINT8  *mFuzzPointer;
+
+CHAR8  mEngUpperMap[MAP_TABLE_SIZE];
+CHAR8  mEngLowerMap[MAP_TABLE_SIZE];
+CHAR8  mEngInfoMap[MAP_TABLE_SIZE];
+
+CHAR8  mOtherChars[] = {
+  '0',
+  '1',
+  '2',
+  '3',
+  '4',
+  '5',
+  '6',
+  '7',
+  '8',
+  '9',
+  '\\',
+  '.',
+  '_',
+  '^',
+  '$',
+  '~',
+  '!',
+  '#',
+  '%',
+  '&',
+  '-',
+  '{',
+  '}',
+  '(',
+  ')',
+  '@',
+  '`',
+  '\'',
+  '\0'
+};
+
+VOID
+UnicodeCollationInitializeMappingTables (
+  VOID
+  )
+{
+  UINTN  Index;
+  UINTN  Index2;
+
+  //
+  // Initialize mapping tables for the supported languages
+  //
+  for (Index = 0; Index < MAP_TABLE_SIZE; Index++) {
+    mEngUpperMap[Index] = (CHAR8)Index;
+    mEngLowerMap[Index] = (CHAR8)Index;
+    mEngInfoMap[Index]  = 0;
+
+    if (((Index >= 'a') && (Index <= 'z')) || ((Index >= 0xe0) && (Index <= 0xf6)) || ((Index >= 0xf8) && (Index <= 0xfe))) {
+      Index2               = Index - 0x20;
+      mEngUpperMap[Index]  = (CHAR8)Index2;
+      mEngLowerMap[Index2] = (CHAR8)Index;
+
+      mEngInfoMap[Index]  |= CHAR_FAT_VALID;
+      mEngInfoMap[Index2] |= CHAR_FAT_VALID;
+    }
+  }
+
+  for (Index = 0; mOtherChars[Index] != 0; Index++) {
+    Index2               = mOtherChars[Index];
+    mEngInfoMap[Index2] |= CHAR_FAT_VALID;
+  }
+}
+
+/**
+  Performs a case-insensitive comparison of two Null-terminated strings.
+
+  @param  This Protocol instance pointer.
+  @param  Str1 A pointer to a Null-terminated string.
+  @param  Str2 A pointer to a Null-terminated string.
+
+  @retval 0   Str1 is equivalent to Str2
+  @retval > 0 Str1 is lexically greater than Str2
+  @retval < 0 Str1 is lexically less than Str2
+
+**/
+INTN
+StriColl (
+  IN CHAR16  *Str1,
+  IN CHAR16  *Str2
+  )
+{
+  while (*Str1 != 0) {
+    if (TO_UPPER (*Str1) != TO_UPPER (*Str2)) {
+      break;
+    }
+
+    Str1 += 1;
+    Str2 += 1;
+  }
+
+  return TO_UPPER (*Str1) - TO_UPPER (*Str2);
+}
+
+/**
+   Initialises Unicode collation, which is needed for case-insensitive string comparisons
+   within the driver (a good example of an application of this is filename comparison).
+
+   @param[in]      DriverHandle    Handle to the driver image.
+
+   @retval EFI_SUCCESS   Unicode collation was successfully initialised.
+   @retval !EFI_SUCCESS  Failure.
+**/
+EFI_STATUS
+Ext4InitialiseUnicodeCollation (
+  EFI_HANDLE  DriverHandle
+  )
+{
+  UnicodeCollationInitializeMappingTables ();
+  return EFI_SUCCESS;
+}
+
+/**
+   Does a case-insensitive string comparison. Refer to EFI_UNICODE_COLLATION_PROTOCOL's StriColl
+   for more details.
+
+   @param[in]      Str1   Pointer to a null terminated string.
+   @param[in]      Str2   Pointer to a null terminated string.
+
+   @retval 0   Str1 is equivalent to Str2.
+   @retval >0  Str1 is lexically greater than Str2.
+   @retval <0  Str1 is lexically less than Str2.
+**/
+INTN
+Ext4StrCmpInsensitive (
+  IN CHAR16  *Str1,
+  IN CHAR16  *Str2
+  )
+{
+  return StriColl (Str1, Str2);
+}
 
 EFI_STATUS
 EFIAPI
@@ -118,6 +259,7 @@ LLVMFuzzerTestOneInput (
 {
   EFI_STATUS         Status;
   EXT4_PARTITION     *Part;
+  EXT4_FILE          *File;
   EFI_FILE_PROTOCOL  *This;
   UINTN              BufferSize;
   VOID               *Buffer;
@@ -126,6 +268,7 @@ LLVMFuzzerTestOneInput (
   VOID               *Info;
   UINTN              Len;
   UINT64             Position;
+  UINT64             FileSize;
 
   mFuzzOffset  = 0;
   mFuzzPointer = FuzzData;
@@ -254,9 +397,46 @@ LLVMFuzzerTestOneInput (
 
     Ext4SetInfo (NewHandle, &gEfiFileSystemVolumeLabelInfoIdGuid, Len, Info);
 
+    //
+    // Test position functions
+    //
     Ext4GetPosition (NewHandle, &Position);
-    while (!EFI_ERROR (Ext4SetPosition (NewHandle, Position))) {
-      ++Position;
+    Ext4SetPosition (NewHandle, Position);
+
+    //
+    // Trying to reach the end of file and read/write it
+    //
+    Position = (UINT64)-1;
+    Status   = Ext4SetPosition (NewHandle, Position);
+    if (!EFI_ERROR (Status)) {
+      Buffer     = NULL;
+      BufferSize = 0;
+      Status     = Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+      if (Status == EFI_BUFFER_TOO_SMALL) {
+        Buffer = AllocateZeroPool (BufferSize);
+        if (Buffer == NULL) {
+          FreeAll (FileName, Part);
+          return 0;
+        }
+
+        ASAN_CHECK_MEMORY_REGION (Buffer, BufferSize);
+
+        Ext4ReadFile (NewHandle, &BufferSize, Buffer);
+
+        Ext4WriteFile (NewHandle, &BufferSize, Buffer);
+
+        FreePool (Buffer);
+      }
+    }
+
+    //
+    // Trying to reach out of bound of FileSize
+    //
+    File     = EXT4_FILE_FROM_THIS (NewHandle);
+    FileSize = EXT4_INODE_SIZE (File->Inode);
+    if (FileSize < (UINT64)-1 - 1) {
+      Position = FileSize + 1;
+      Ext4SetPosition (NewHandle, Position);
     }
 
     Ext4Delete (NewHandle);
